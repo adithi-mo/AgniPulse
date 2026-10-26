@@ -4,6 +4,9 @@ import 'dart:typed_data';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // lets us buzz the phone and copy text
+import 'package:flutter_tts/flutter_tts.dart'; // makes the phone talk
+import 'package:url_launcher/url_launcher.dart'; // opens the phone dialer
 
 void main() => runApp(const AgniPulseApp());
 
@@ -66,6 +69,8 @@ const List<Emergency> emergencies = [
     'Lay them flat and lift their legs. If breathing is hard, let them sit up.',
     'Stay with them until help comes.',
   ]),
+  // No steps here on purpose: opening this one starts the Pace Practice trainer.
+  Emergency('CPR Pace Practice', Icons.speed, Color(0xFF40C4FF), []),
 ];
 
 // ---------- Makes a short "beep" sound in memory (no sound file needed) ----------
@@ -125,6 +130,16 @@ class _HomeScreenState extends State<HomeScreen> {
   final Uint8List _beep = makeBeep();
   final List<String> _log = [];
   final Set<String> _done = {};
+  int compressions = 0; // how many beats since the CPR Beat started
+  final FlutterTts _tts = FlutterTts(); // the voice that reads steps aloud
+  bool practicing = false; // true while the Pace Practice screen is open
+  final List<DateTime> _padTaps = []; // times of the last taps on the practice pad
+  int? padBpm; // the speed we measured (beats per minute)
+  final List<DateTime> _taps = []; // times of recent taps (for the panic detector)
+
+  // YOUR TURN: write the real source you checked the steps against.
+  // Only keep this if it is true!
+  static const String mySource = 'American Red Cross first aid guidance';
 
   void _addLog(String msg) {
     final n = DateTime.now();
@@ -135,11 +150,17 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _open(Emergency e) {
+    if (e.steps.isEmpty) {
+      setState(() => practicing = true);
+      _addLog('Opened: CPR pace practice');
+      return;
+    }
     setState(() {
       current = e;
       step = 0;
     });
     _addLog('Opened: ${e.name}');
+    if (stress) _speak('${e.name}. Step 1. ${e.steps[0]}');
   }
 
   void _close() {
@@ -149,7 +170,16 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _tick() {
     _player.play(BytesSource(_beep, mimeType: 'audio/wav')).catchError((_) {});
-    setState(() => pulse = !pulse);
+    HapticFeedback.mediumImpact().catchError((_) {}); // buzz on every beat
+    setState(() {
+      pulse = !pulse;
+      compressions++;
+    });
+    // At 100 beats a minute, 200 beats is 2 minutes. Tired pushers do worse CPR,
+    // so we remind people to switch.
+    if (compressions % 200 == 0) {
+      _addLog('2 minutes of CPR - switch pushers if someone can take over');
+    }
   }
 
   void _toggleBeat() {
@@ -158,6 +188,7 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => beating = false);
       _addLog('CPR beat stopped');
     } else {
+      compressions = 0;
       _timer = Timer.periodic(const Duration(milliseconds: beatMs), (_) => _tick());
       _tick();
       setState(() => beating = true);
@@ -170,6 +201,20 @@ class _HomeScreenState extends State<HomeScreen> {
     _timer?.cancel();
     _player.dispose();
     super.dispose();
+  }
+
+  // PANIC DETECTOR: people who panic tap the screen very fast.
+  // If we see 6 taps in 3 seconds, we turn Stress Mode ON for them.
+  void _watchForPanic() {
+    final now = DateTime.now();
+    if (practicing) return; // fast taps on the practice pad are not panic
+    _taps.add(now);
+    _taps.removeWhere((t) => now.difference(t).inMilliseconds > 3000);
+    if (_taps.length >= 6 && !stress) {
+      _taps.clear();
+      setState(() => stress = true);
+      _addLog('Fast tapping noticed - Stress Mode turned ON automatically');
+    }
   }
 
   // ---------- Pieces of the screen ----------
@@ -195,6 +240,148 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  // ---------- NEW: voice, 911, and pace practice ----------
+
+  // Reads text out loud. Browsers only allow talking after a tap, so we call this from taps.
+  Future<void> _speak(String text) async {
+    try {
+      await _tts.stop();
+      await _tts.setSpeechRate(0.5);
+      await _tts.speak(text);
+      _addLog('Reading aloud');
+    } catch (_) {}
+  }
+
+  // The HEAR IT button: reads the current step (Stress Mode) or all steps (Standard Mode).
+  Future<void> _readAloud() async {
+    final e = current;
+    if (e == null) {
+      await _speak('Pick an emergency. ${emergencies.map((x) => x.name).join(', ')}.');
+    } else if (stress) {
+      await _speak('Step ${step + 1}. ${e.steps[step]}');
+    } else {
+      await _speak(e.steps.join(' Next. '));
+    }
+  }
+
+  // Opens the phone's dial screen with 911 typed in. The person still presses call.
+  Future<void> _call911() async {
+    _addLog('Tapped CALL 911');
+    final ok = await launchUrl(Uri.parse('tel:911')).catchError((_) => false);
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('This device cannot dial. Use a phone and call 911.')),
+      );
+    }
+  }
+
+  // PACE TRAINER: measures how fast you tap and says if it is good CPR speed.
+  void _padTap() {
+    _padTaps.add(DateTime.now());
+    if (_padTaps.length > 8) _padTaps.removeAt(0); // only look at the last 8 taps
+    if (_padTaps.length >= 4) {
+      final ms = _padTaps.last.difference(_padTaps.first).inMilliseconds;
+      // 4 taps make 3 gaps. Beats per minute = gaps * 60000 / total milliseconds.
+      if (ms > 0) padBpm = ((_padTaps.length - 1) * 60000 / ms).round();
+    }
+    setState(() {});
+  }
+
+  Widget _practice() {
+    final b = padBpm;
+    final good = b != null && b >= 100 && b <= 120; // the CPR range: 100 to 120 a minute
+    final verdict = b == null
+        ? 'Keep tapping...'
+        : (b < 100 ? 'TOO SLOW - tap faster' : (b > 120 ? 'TOO FAST - slow down' : 'GOOD PACE!'));
+    final color = b == null ? Colors.grey : (good ? Colors.greenAccent : Colors.orangeAccent);
+    return Padding(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        children: [
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: () {
+                setState(() {
+                  practicing = false;
+                  _padTaps.clear();
+                  padBpm = null;
+                });
+                _addLog('Left CPR pace practice');
+              },
+              icon: const Icon(Icons.arrow_back),
+              label: const Text('Back'),
+            ),
+          ),
+          const Text('CPR PACE PRACTICE',
+              style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900)),
+          const Text('Tap the circle to the beat. Aim for 100 to 120 a minute.',
+              textAlign: TextAlign.center),
+          Expanded(
+            child: Center(
+              child: GestureDetector(
+                onTapDown: (_) => _padTap(),
+                child: Container(
+                  width: 230,
+                  height: 230,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(shape: BoxShape.circle, color: color),
+                  child: Text(b == null ? 'TAP' : '$b',
+                      style: const TextStyle(
+                          fontSize: 70, fontWeight: FontWeight.w900, color: Colors.black)),
+                ),
+              ),
+            ),
+          ),
+          Text(verdict,
+              style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900, color: color)),
+        ],
+      ),
+    );
+  }
+
+  // Two big buttons that are always on screen: CALL 911 and HEAR IT.
+  Widget _helpBar() {
+    final h = stress ? 76.0 : 48.0;
+    return Container(
+      color: const Color(0xFF0D1117),
+      padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+      child: Row(
+        children: [
+          Expanded(
+            flex: 3,
+            child: SizedBox(
+              height: h,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.red, foregroundColor: Colors.white),
+                icon: Icon(Icons.call, size: stress ? 36 : 22),
+                label: Text('CALL 911',
+                    style: TextStyle(fontSize: stress ? 30 : 18, fontWeight: FontWeight.w900)),
+                onPressed: _call911,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            flex: 2,
+            child: SizedBox(
+              height: h,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.lightBlueAccent, foregroundColor: Colors.black),
+                icon: Icon(Icons.volume_up, size: stress ? 36 : 22),
+                label: Text('HEAR IT',
+                    style: TextStyle(fontSize: stress ? 26 : 16, fontWeight: FontWeight.w900)),
+                onPressed: _readAloud,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -287,6 +474,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     if (step > 0) {
                       setState(() => step--);
                       _addLog('Back to step ${step + 1} of ${e.name}');
+                      _speak(e.steps[step]);
                     } else {
                       _close();
                     }
@@ -301,6 +489,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       _close();
                     } else {
                       setState(() => step++);
+                      _speak(e.steps[step]);
                     }
                   }),
                 ),
@@ -323,6 +512,7 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         Text(e.name,
             style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: e.color)),
+        Text('Source: $mySource', style: const TextStyle(color: Colors.white54)),
         const SizedBox(height: 8),
         for (var i = 0; i < e.steps.length; i++)
           Card(
@@ -362,7 +552,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           icon: Icon(beating ? Icons.stop : Icons.favorite, size: stress ? 40 : 24),
           label: Text(
-            beating ? 'STOP BEAT' : 'CPR BEAT (100 BPM)',
+            beating ? 'STOP  -  $compressions pushes' : 'CPR BEAT (100 BPM)',
             style: TextStyle(fontSize: stress ? 28 : 18, fontWeight: FontWeight.w900),
           ),
           onPressed: _toggleBeat,
@@ -379,6 +569,15 @@ class _HomeScreenState extends State<HomeScreen> {
         title: Text('Action Log (${_log.length}) - tap to open',
             style: const TextStyle(fontSize: 14)),
         children: [
+          TextButton.icon(
+            icon: const Icon(Icons.copy, size: 18),
+            label: const Text('Copy log for paramedics'),
+            onPressed: () {
+              Clipboard.setData(ClipboardData(
+                  text: 'AgniPulse action log (oldest first)\n${_log.reversed.join('\n')}'));
+              _addLog('Log copied');
+            },
+          ),
           Container(
             height: 130,
             width: double.infinity,
@@ -398,7 +597,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    return Listener(
+      onPointerDown: (_) => _watchForPanic(),
+      child: Scaffold(
       appBar: AppBar(
         backgroundColor: const Color(0xFF161B22),
         title: const Text('AgniPulse', style: TextStyle(fontWeight: FontWeight.bold)),
@@ -415,12 +616,14 @@ class _HomeScreenState extends State<HomeScreen> {
               style: TextStyle(fontWeight: FontWeight.bold),
             ),
           ),
+          _helpBar(),
           _stressSwitch(),
-          Expanded(child: current == null ? _home() : _steps()),
+          Expanded(child: practicing ? _practice() : (current == null ? _home() : _steps())),
           _beatBar(),
           _logBox(),
         ],
       ),
+    ),
     );
   }
 }
