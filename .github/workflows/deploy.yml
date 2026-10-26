@@ -21,7 +21,7 @@ jobs:
       - name: Add the web files Flutter needs
         run: flutter create . --platforms web --project-name agnipulse
       - name: Add the sound helper
-        run: flutter pub add audioplayers:^6.1.0
+        run: flutter pub add audioplayers:^6.1.0 flutter_tts url_launcher
       - run: flutter pub get
       - name: Build the website
         run: flutter build web --release --base-href "/${{ github.event.repository.name }}/"
